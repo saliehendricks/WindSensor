@@ -6,10 +6,9 @@
 
 //#include <DNSServer.h>
 #include <ESP8266WiFi.h>
-//#include <WiFiClient.h>
-//#include <ESP8266WebServer.h>
-//#include <ESP8266mDNS.h>
-//#include <WiFiUDP.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <EEPROM.h>
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
 #include <WifiRestClient.h>
@@ -21,7 +20,7 @@ int VaneValue;// raw analog value from wind vane
 int Direction;// translated 0 - 360 direction 
 int CalDirection;// converted value with offset applied 
 int LastValue;
-#define Offset 0; 
+int Offset = 0; 
 
 //wind speed vals
 #define WindSensorPin (4) // The pin location of the anemometer sensor D2
@@ -41,13 +40,12 @@ String restcall = "";
 int lastSent = 0;
 bool isPubNub = true;
 String timetoken = "";
+int publishInterval = 15000;
+ESP8266WebServer server(80);
 
 // WiFi parameters
 char* internal_ssid = "NURIO";
 char* internal_password = "12345";
-
-#define LISTEN_PORT           80
-WiFiServer wifiServer(LISTEN_PORT);
 
 char* device_id = "snw1";
 
@@ -56,14 +54,38 @@ void setup() {
 	Serial.begin(115200);
 
 	Serial.println("Config starting...");
+	//
+	EEPROM.begin(512);//2 x 4bytes (for offset which can be -359 to +359, EEPROM stores only 255 per byte) + 4bytes for the publish interval 0-255 seconds
+
+	int offsetMem1 = 361;
+	offsetMem1 = EEPROM.read(0);
+	int offsetMem2 = 361;
+	offsetMem2 = EEPROM.read(1);
+
+	int pubsubintervalMem = -1;
+	pubsubintervalMem = EEPROM.read(3);
+
+	Serial.print("EEPROM stored: Offset = "); Serial.print(offsetMem1 + offsetMem2); Serial.print(" publish interval = "); Serial.println(pubsubintervalMem);
+	//if the memory values are valid set the variables
+	if (offsetMem1 + offsetMem2 > -359 & offsetMem1 + offsetMem2 < 361) {
+		Offset = offsetMem1 + offsetMem2;
+		Serial.println("EEPROM restored offset = " + (String)Offset);
+	}
+	
+	//more than 5 seconds and less than 5mins
+	if (pubsubintervalMem > 5 & pubsubintervalMem < 600) {
+		publishInterval = pubsubintervalMem * 1000; //convert to milliseconds
+		Serial.println("EEPROM restored publish interval = " + (String)publishInterval);
+	}
+	
 
 	//Wifi setup
 	WiFiManager wifi;
 	wifi.autoConnect("SNWind");
 	Serial.println("Connected to wifi ok)");
 
-	wifiServer.begin();
-	Serial.println("Web Server started");
+	//wifiServer.begin();
+	//Serial.println("Web Server started");
 	Serial.print("Chip ID: ");;
 	Serial.println(String(ESP.getChipId(), HEX));
 
@@ -96,17 +118,28 @@ void setup() {
 	Serial.println("OTA Ready");
 	Rotations = 0;
 
+	pinMode(LED_BUILTIN, OUTPUT);
+
+	//Web Server
+	if (MDNS.begin("snwind1")) {
+		Serial.println("MDNS responder started");
+	}
+	
+	server.on("/", handleRoot);
+	server.on("/set", handleSetArg); ///set?offset=25
+	server.onNotFound(handleNotFound);
+	server.begin();
+	Serial.println("HTTP server started");
+
 }
 
 void loop() {
+
+	server.handleClient();
+	
 	//WIND SPEED
 	//Rotations = 0; // Set Rotations count to 0 ready for calculations 
 	currentMills = millis();
-
-	
-	//sei(); // Enables interrupts 
-	//delay(3000); // Wait 3 seconds to average 
-	//cli(); // Disable interrupts 
 
 	// convert to mp/h using the formula V=P(2.25/T) 
 	// V = P(2.25/3) = P * 0.75   * 1.609344 to km/h 
@@ -118,6 +151,8 @@ void loop() {
 		Serial.println(WindSpeed);
 		lastSampleTime = millis();
 		Rotations = 0;
+
+		
 	}
 
 	//WIND DIRECTION
@@ -131,24 +166,23 @@ void loop() {
 	if (CalDirection < 0)
 		CalDirection = CalDirection + 360;
 
-	// Only update the display if change greater than 2 degrees. 
-	if (abs(CalDirection - LastValue) > 5)
-	{
+	//// Only update the display if change greater than 25 degrees. 
+	//if (abs(CalDirection - LastValue) > 25)
+	//{
+	//	Serial.print(VaneValue); Serial.print("\t\t");
+	//	Serial.print(CalDirection); Serial.print("\t\t");
+	//	getHeading(CalDirection);
+	//	LastValue = CalDirection;
+	//}
+
+	if (isPubNub & (currentMills - lastSent > publishInterval | lastSent == 0)) {
+		
 		Serial.print(VaneValue); Serial.print("\t\t");
 		Serial.print(CalDirection); Serial.print("\t\t");
-		getHeading(CalDirection);
-		LastValue = CalDirection;
-	}
 
-	if (isPubNub & (currentMills - lastSent > 10000 | lastSent == 0)) {
+		digitalWrite(LED_BUILTIN, LOW);
 		
-		//delay(5000);
-		/*WiFiClient client;
-		const int httpPort = 80;
-		if (!client.connect(pubnubUrl, httpPort)) {
-			Serial.println("pubnub connection failed");
-			return;
-		}*/
+		
 		WiFiRestClient restClient(pubnubUrl);
 		restcall = push1 + "%7B%22id%22%3A%22" + device_id + "%22%2C%22t%22%3A%22" + timetoken + "%22%2C%22kmh%22%3A" + WindSpeed + "%2C%22dir%22%3A%22" + heading + "%22%2C%22bear%22%3A" + CalDirection + "%7D";
 
@@ -163,28 +197,11 @@ void loop() {
 		timetoken = response.substring(response.lastIndexOf(",")+1);
 		//timetoken = response;
 
-		//client.print(String("GET ") + restcall + " HTTP/1.1\r\n" +
-		//	"Host: " + pubnubUrl + "\r\n" +
-		//	"Connection: close\r\n\r\n");
-		//unsigned long timeout = millis();
-		//while (client.available() == 0) {
-		//	if (millis() - timeout > 5000) {
-		//		Serial.println(">>> Client Timeout !");
-		//		client.stop();
-		//		return;
-		//	}
-		//}
-
-		//// Read all the lines of the reply from server and print them to Serial
-		//while (client.available()) {
-		//	String line = client.readStringUntil('\r');
-		//	Serial.print(line);
-		//}
 		lastSent = millis();
-		//yield();
+		digitalWrite(LED_BUILTIN, HIGH);
+		
 	}
 	
-
 }
 
 // Converts compass direction to heading 
@@ -248,3 +265,79 @@ void rotation() {
 
 }
 
+
+void handleRoot() {
+	digitalWrite(LED_BUILTIN, LOW);
+	String homepage = "<div style='font-family:Tahoma, Sans-Serif'><img src='http://sncdn.com/res/img/homepage/safarinow.png'> <br/><br/> SNWind Ready! <br/><br/> Set offset (-360 to 360):<input type=\"number\" id=\"offset\" min='-360' max='360' value='" + (String)Offset;
+	homepage += "'/><a href='#' onclick=\"window.open('/set?offset=' + document.getElementById('offset').value); \"> save</a>  <br/><br/>    Publish data every:<input type=\"number\" id=\"pubtime\" min='5' max='255' value='" + (String)(publishInterval/1000);
+	homepage += "'/><span> seconds</span>  <a href='#' onclick=\"window.open('/set?pubtime=' + document.getElementById('pubtime').value); \">save</a></div>";
+	server.send(200, "text/html", homepage);
+	digitalWrite(LED_BUILTIN, HIGH);	
+}
+
+void handleNotFound() {
+	digitalWrite(LED_BUILTIN, LOW);
+	String message = "Oops, Page Not Found\n\n";
+	message += "URI: ";
+	message += server.uri();
+	message += "\nMethod: ";
+	message += (server.method() == HTTP_GET) ? "GET" : "POST";
+	message += "\nArguments: ";
+	message += server.args();
+	message += "\n";
+	for (uint8_t i = 0; i<server.args(); i++) {
+		message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+	}
+	server.send(404, "text/plain", message);
+	digitalWrite(LED_BUILTIN, HIGH);
+}
+
+void handleSetArg() {
+
+	String message = "";
+	if (server.arg("offset").length() > 0)
+	{   
+		//Parameter found
+		String offSetparam = server.arg("offset");
+		Serial.println("offset requested:" + offSetparam);
+		Offset = atoi(offSetparam.c_str());
+		message = "Offset is now set to: " + (String)Offset;
+		Serial.println(message);
+		server.send(200, "text/plain", message);
+		
+		//we split the value by 2 and always store it half half so that it doesnt overflow
+		if (Offset % 2 == 0) {
+			EEPROM.write(0, Offset / 2);
+		}
+		else {
+			EEPROM.write(0, Offset / 2 + 1);
+		}
+		EEPROM.write(1, Offset / 2);
+		EEPROM.commit();
+		message = "EEPROM offset commited - " + (String)Offset;
+		Serial.println(message);
+		
+	}
+	else if (server.arg("pubtime").length() > 0)
+	{
+		//Parameter found
+		String param = server.arg("pubtime");
+		Serial.println("param requested:" + param);
+		publishInterval = atoi(param.c_str()) * 1000;
+		message = "pubtime is now set to: " + (String)(publishInterval/1000);
+		Serial.println(message);
+		server.send(200, "text/plain", message);
+
+		EEPROM.write(2, publishInterval);
+		EEPROM.commit();
+
+		message = "EEPROM publish time commited - " + (String)publishInterval;
+		Serial.println(message);
+	}
+	else 
+	{     
+		message = "Not settings updated, Offset: " + (String)Offset + " pubtime (sec):" + (String)publishInterval;
+		server.send(200, "text/plain", message);          //Returns the HTTP response
+	}
+	
+}
